@@ -6,11 +6,23 @@
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js'
 
 const SESSION_KEY = 'tuling_session_v1'
+const TOKEN_KEY = 'tuling_token_v1'
 const TABLE_USERS = 'tu_users'
 const TABLE_CONFIG = 'tu_config'
 const TABLE_PHOTOS = 'tu_photos'
+const USER_COLUMNS = 'id,username,name,role,status,create_time,last_login_time'
 
 let initPromise = null
+let sessionToken = localStorage.getItem(TOKEN_KEY) || ''
+
+function authHeaders() {
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    'Content-Type': 'application/json',
+    'x-app-token': sessionToken
+  }
+}
 
 async function request(path, options = {}) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -21,9 +33,7 @@ async function request(path, options = {}) {
     response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
       method: options.method || 'GET',
       headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
+        ...authHeaders(),
         ...(options.headers || {})
       },
       body: options.body
@@ -36,7 +46,37 @@ async function request(path, options = {}) {
   if (!response.ok) {
     const detail = await response.text()
     console.error('[Supabase] request failed', path, response.status, detail)
+    if (response.status === 401 || response.status === 403) {
+      clearSession()
+      throw new Error('登录已过期，请重新登录')
+    }
     if (response.status === 409) throw new Error('数据冲突，请重试')
+    throw new Error('云数据库请求失败，请稍后重试')
+  }
+
+  const text = await response.text()
+  return text ? JSON.parse(text) : null
+}
+
+async function rpc(name, payload = {}) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('云端数据库尚未配置')
+  }
+  let response
+  try {
+    response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${name}`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(payload)
+    })
+  } catch (err) {
+    console.error('[Supabase] rpc network failed', name, err)
+    throw new Error('无法连接云数据库，请检查网络')
+  }
+
+  if (!response.ok) {
+    const detail = await response.text()
+    console.error('[Supabase] rpc failed', name, response.status, detail)
     throw new Error('云数据库请求失败，请稍后重试')
   }
 
@@ -89,35 +129,7 @@ export function ensureInit() {
 }
 
 async function doInit() {
-  const users = await request(`${TABLE_USERS}?select=id&limit=1`)
-  if (!users || users.length === 0) {
-    await request(TABLE_USERS, {
-      method: 'POST',
-      headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify([
-        {
-          username: 'admin',
-          name: '管理员',
-          role: 'admin',
-          status: 'active',
-          password_hash: await hashPassword('123456'),
-          create_time: Date.now(),
-          last_login_time: 0
-        }
-      ])
-    })
-    console.info('[Init] default admin created')
-  }
-
-  const config = await request(`${TABLE_CONFIG}?select=key&limit=1`)
-  if (!config || config.length === 0) {
-    await request(`${TABLE_CONFIG}?on_conflict=key`, {
-      method: 'POST',
-      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-      body: JSON.stringify([{ key: 'app', max_users: 30 }])
-    })
-    console.info('[Init] default config created')
-  }
+  await rpc('tu_bootstrap')
 }
 
 /* ---------------- 登录与会话 ---------------- */
@@ -126,19 +138,16 @@ export async function login(username, password) {
   const account = String(username || '').trim()
   if (!account || !password) throw new Error('请输入账号和密码')
 
-  const rows = await request(`${TABLE_USERS}?username=eq.${encodeURIComponent(account)}&select=*`)
-  const row = rows && rows[0]
-  if (!row) throw new Error('账号不存在')
-  if (row.status === 'disabled') throw new Error('账号已停用，请联系管理员')
-  if (row.password_hash !== (await hashPassword(password))) throw new Error('密码错误')
-
-  await request(`${TABLE_USERS}?id=eq.${row.id}`, {
-    method: 'PATCH',
-    headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ last_login_time: Date.now() })
+  const result = await rpc('tu_login', {
+    p_username: account,
+    p_password_hash: await hashPassword(password)
   })
+  if (!result || result.error) throw new Error((result && result.error) || '登录失败，请稍后重试')
+  if (!result.token || !result.user) throw new Error('登录失败，请稍后重试')
 
-  const user = mapUser(row)
+  sessionToken = result.token
+  localStorage.setItem(TOKEN_KEY, sessionToken)
+  const user = mapUser(result.user)
   setSession(user)
   return user
 }
@@ -160,6 +169,8 @@ export function getSession() {
 }
 
 export function clearSession() {
+  sessionToken = ''
+  localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(SESSION_KEY)
 }
 
@@ -169,7 +180,11 @@ export function clearSession() {
 export async function refreshSession() {
   const cached = getSession()
   if (!cached) return null
-  const rows = await request(`${TABLE_USERS}?id=eq.${cached.id}&select=*`)
+  if (!sessionToken) {
+    clearSession()
+    return null
+  }
+  const rows = await request(`${TABLE_USERS}?id=eq.${cached.id}&select=${USER_COLUMNS}`)
   const row = rows && rows[0]
   if (!row || row.status === 'disabled') {
     clearSession()
@@ -183,7 +198,7 @@ export async function refreshSession() {
 /* ---------------- 账号管理 ---------------- */
 
 export async function getUsers() {
-  const rows = await request(`${TABLE_USERS}?select=*&order=create_time.asc`)
+  const rows = await request(`${TABLE_USERS}?select=${USER_COLUMNS}&order=create_time.asc`)
   return (rows || []).map(mapUser)
 }
 
@@ -198,17 +213,14 @@ export async function getMemberCount() {
 }
 
 export async function changePassword(userId, oldPassword, newPassword) {
-  const rows = await request(`${TABLE_USERS}?id=eq.${userId}&select=*`)
-  const row = rows && rows[0]
-  if (!row) throw new Error('账号不存在')
-  if (row.password_hash !== (await hashPassword(oldPassword))) throw new Error('原密码不正确')
   const next = String(newPassword || '').trim()
   if (next.length < 4) throw new Error('新密码至少 4 位')
-  await request(`${TABLE_USERS}?id=eq.${userId}`, {
-    method: 'PATCH',
-    headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ password_hash: await hashPassword(next) })
+  const result = await rpc('tu_change_password', {
+    p_user_id: userId,
+    p_old_hash: await hashPassword(oldPassword),
+    p_new_hash: await hashPassword(next)
   })
+  if (!result || result.error) throw new Error((result && result.error) || '修改失败，请稍后重试')
 }
 
 export async function addMember({ name, username, password }) {
